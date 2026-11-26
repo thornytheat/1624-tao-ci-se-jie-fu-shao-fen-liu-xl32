@@ -3,7 +3,7 @@ from functools import lru_cache
 import json
 import os
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response
@@ -11,9 +11,17 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
 
 from .shade_disposition.service import compare_records, evidence, export_table
-from .kiln_dispatch.contracts import RevisionConflict, UnknownRelease
+from .kiln_dispatch.contracts import RevisionConflict, UnknownRelease, UnknownRebook
 from .kiln_dispatch.history import release_changes
 from .kiln_dispatch.service import list_releases, read_release, register
+from .kiln_dispatch.rebooking import (
+    list_rebookings,
+    plan_rebooking,
+    read_rebooking,
+    register_rebooking,
+    outcome_delivery,
+    rebook_delivery,
+)
 from .engine import ROOT, plan
 from .settings import DEFAULT_BUDGET, DEFAULT_DAY, MODEL_LABEL, PROJECT_NAME
 
@@ -48,6 +56,23 @@ class PlanInput(BaseModel):
 class RegisterInput(PlanInput):
     expected_generation: StrictInt = Field(ge=0)
     run_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class RebookInput(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    expected_generation: StrictInt = Field(default=0, ge=0)
+    capacity: StrictInt | None = Field(default=None, ge=0, le=100)
+    group_limit: int | dict[str, int] | None = None
+    originals: list[dict[str, Any]] | None = None
+    waitlist: list[dict[str, Any]] | None = None
+    candidates: list[dict[str, Any]] | None = None
+    frozen_ids: list[str] | None = None
+    rebook_id: str | None = None
+    run_id: str | None = None
+    base_generation: StrictInt | None = Field(default=None, ge=0)
+    release_generation: StrictInt | None = Field(default=None, ge=1)
+    register_as_release: bool = False
 
 
 def store():
@@ -185,6 +210,75 @@ def archived(generation: int):
         return asdict(read_release(store(), generation))
     except UnknownRelease as exc:
         raise HTTPException(404, str(exc)) from exc
+
+
+@app.get("/api/rebooks")
+@app.get("/api/rebook")
+@app.get("/api/rebookings")
+@app.get("/api/rebooking")
+def rebook_history(
+    limit: Annotated[int, Query(ge=1, le=100)] = 30,
+):
+    try:
+        return [asdict(item) for item in list_rebookings(store(), limit)]
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.get("/api/rebooks/{generation}")
+@app.get("/api/rebook/{generation}")
+@app.get("/api/rebookings/{generation}")
+@app.get("/api/rebooking/{generation}")
+def archived_rebook(generation: int):
+    try:
+        return asdict(read_rebooking(store(), generation))
+    except UnknownRebook as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.post("/api/rebooks", status_code=201)
+@app.post("/api/rebook", status_code=201)
+@app.post("/api/rebookings", status_code=201)
+@app.post("/api/rebooking", status_code=201)
+@app.post("/api/shift-rebook", status_code=201)
+@app.post("/api/shift-rebooking", status_code=201)
+def create_rebook(command: RebookInput):
+    data = command.model_dump(exclude_none=True)
+    expected = data.pop("expected_generation", 0)
+    release_generation = data.pop("release_generation", None)
+    as_release = data.pop("register_as_release", False)
+    rebook_id = data.pop("rebook_id", None)
+    run_id = data.pop("run_id", None)
+    base_generation = data.pop("base_generation", None)
+    try:
+        if release_generation is not None:
+            base = read_release(store(), release_generation)
+            delivery = rebook_delivery(base, **data)
+            if command.run_id and delivery.digest != command.run_id:
+                raise HTTPException(409, "改签证据已经变化，请按新方案重新核对")
+            receipt = register(store(), delivery, expected)
+            return {
+                **asdict(receipt),
+                "rebook_evidence": delivery.body["same_day_rebook"],
+            }
+        outcome = plan_rebooking(**data)
+        if as_release:
+            receipt = register(store(), outcome_delivery(outcome), expected)
+        else:
+            receipt = register_rebooking(
+                store(),
+                outcome,
+                expected,
+                rebook_id=rebook_id or run_id,
+                base_generation=base_generation,
+            )
+        return asdict(receipt)
+    except UnknownRelease as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except RevisionConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
 
 
 @app.get("/api/release-differences")

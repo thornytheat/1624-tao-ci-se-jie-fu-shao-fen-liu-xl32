@@ -4,6 +4,20 @@ import json
 from ..shade_disposition.service import canonical, digest
 from .contracts import Release, ReleaseDigest, RevisionConflict, UnknownRelease
 from .storage import current, database, duplicate, get, insert, recent
+from .rebooking import (
+    RebookOutcome,
+    RebookStore,
+    commit_change,
+    commit_rebooking,
+    list_rebookings,
+    outcome_delivery,
+    plan_rebooking,
+    read_rebooking,
+    rebook,
+    rebook_delivery,
+    register_change,
+    register_rebooking,
+)
 
 
 def _restore(row, replayed=False):
@@ -40,6 +54,9 @@ def _validated_body(delivery):
 
 
 def register(path, delivery, expected: int) -> Release:
+    if isinstance(delivery, RebookOutcome):
+        # 纯改签结果也可以直接复用 releases 的版本链和并发裁决。
+        delivery = outcome_delivery(delivery)
     if type(expected) is not int or expected < 0:
         raise ValueError("登记需提供非负的当前版本号")
     body = _validated_body(delivery)
